@@ -1,0 +1,35 @@
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build and distribution output
+build/
+dist/
+site/
+public/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# Local environment
+.env
+.env.*
+venv/
+.venv/
