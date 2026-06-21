@@ -24,6 +24,7 @@ riscv-toolchain-notes/
   topics.md
   drafts/
   published/
+  talks/
   templates/
   examples/
   scripts/
@@ -32,6 +33,7 @@ riscv-toolchain-notes/
 - `topics.md`: 选题池。
 - `drafts/`: 草稿和未完成的技术笔记。
 - `published/`: 已发布或相对稳定的文章。
+- `talks/`: 公开演讲, slides 和其他材料.
 - `templates/`: 写作模板。
 - `examples/`: 最小化的代码示例。
 - `scripts/`: 写作、检查或仓库维护相关的辅助脚本。
@@ -46,6 +48,6 @@ See [LICENSE](LICENSE) and [LICENSE-CODE](LICENSE-CODE) for details.
 
 ## Author
 
-Jiawei Chen (ISCAS)
+Jiawei Chen jiawei@iscas.ac.cn (ISCAS)
 
 Focus: RISC-V GNU Toolchain / GCC / GNU Binutils / RISC-V ISA extension enablement

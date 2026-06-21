@@ -36,5 +36,7 @@ venv/
 
 # Local private notes
 .local/
+talk-drafts/
 *.private.md
 PRIVATE_*.md
+~$*.pptx
