@@ -1,0 +1,257 @@
+= 如何判断一个 RISC-V 扩展是否需要工具链支持
+Jiawei Chen
+:toc:
+:toclevels: 3
+:sectnums:
+:source-highlighter: highlight.js
+
+从规范变化到 Binutils、GCC、链接器与运行时的分层判断。
+
+[quote]
+____
+“一个扩展是否需要工具链支持”通常不是简单的“需要 / 不需要”。更准确的问题是：这个扩展改变了哪些软件可见属性，工具链中的哪些组件必须理解它，以及工具链支持应当做到哪一层。
+____
+
+== 先把问题从需要不需要支持得“二选一”变成工具链需要的“支持矩阵”
+
+RISC-V 通过模块化扩展不断增加新的指令、架构状态、平台能力和行为保证。面对一个新扩展时，工具链开发者最容易提出的问题是：“这个扩展需不需要工具链支持？”
+
+这个问法过于粗糙。新增指令的扩展通常至少需要汇编器和反汇编器支持，但不一定需要 GCC 自动生成这些指令；不增加任何新指令的扩展，也可能仍然需要 `-march` 解析、版本与依赖关系、ELF 属性或运行时特性暴露。
+
+因此，更合适的工作方法是：先从规范中列出扩展改变的“软件可见属性”，再把这些变化映射到 GNU Binutils、GCC、链接器、调试器、运行库和测试体系。本文以 GNU Toolchain 为主，绝大多数判断思路同样适用于 LLVM。
+
+== 第一步：找到权威规范，并确认你读的是哪一个版本
+
+RISC-V International 已将已批准规范集中到 https://docs.riscv.org/reference/home/index.html[RISC-V Ratified Specifications Library] 中，可以直接查阅 Unprivileged ISA、Privileged ISA、Profiles、ABI 等文档。与其依赖搜索引擎中的旧 PDF 或二手文章，更稳妥的做法是从规范库入口开始，并记录扩展名称、版本和生命周期状态。
+
+如果扩展尚未 ratified，应额外记录 working draft 的 tag、commit 或发布日期；如果是厂商扩展，则需要一份公开、稳定且可引用的规范，并检查扩展名、助记符和 CSR 名称是否符合 https://github.com/riscv-non-isa/riscv-toolchain-conventions/blob/main/src/toolchain-conventions.adoc[vendor extension conventions]。
+
+=== 不要只看“非特权 / 特权”两卷手册
+
+[cols="2,3,3,4",options="header"]
+|===
+|规范类别 |典型内容 |主要软件使用者 |常见工具链影响
+
+|Unprivileged ISA
+|算术、位操作、向量、原子、缓存管理等指令及其行为
+|应用、基础库、编译器生成代码
+|ISA parser、assembler/disassembler、builtin/intrinsic、backend codegen
+
+|Privileged ISA
+|特权级、陷阱、中断、CSR、虚拟内存、PMP 等
+|固件、内核、hypervisor、调试器
+|CSR 名称、headers、调试信息、特性标识；通常较少触发通用 C/C++ 自动 codegen
+
+|Profiles / 属性类扩展
+|平台必须具备的能力、行为保证或参数约束
+|构建系统、编译器驱动、运行库、部署环境
+|`-march` / profile 解析、依赖展开、ELF attributes、运行时 feature exposure
+
+|psABI / Toolchain conventions
+|调用约定、ELF、relocation、属性合并、厂商命名
+|assembler、linker、compiler、loader
+|对象文件兼容性、链接检查、relaxation、公共接口约束
+|===
+
+=== 阅读规范时可以先做一张“扩展特征清单”
+
+* 扩展的准确名称、版本、状态，以及适用的 RV32 / RV64 基础架构。
+* 它属于 unprivileged、privileged、Profile 属性，还是 shorthand / aggregate extension。
+* 是否新增指令、编码、伪指令、操作数类型或汇编可见的寄存器名称。
+* 是否新增 CSR、CSR 字段、架构状态，或改变已有指令 / 状态的语义。
+* 依赖哪些扩展、隐含哪些扩展、与哪些扩展冲突，以及版本之间是否兼容。
+* 是否影响 ABI、调用约定、ELF attributes、relocation、linker relaxation 或对象文件合并。
+* 程序员是否需要显式访问该能力；编译器是否能够从普通 C/C++ 安全地自动推导。
+* 该能力是否需要运行时检测，尤其是在同一系统可能存在不同 hart 能力或部署目标不确定时。
+
+== 工具链支持不是一条直线，而是一张矩阵
+
+把工具链支持简单排列成“opcodes → 汇编 → builtin → intrinsic → codegen”容易产生误解：这些工作并不总是线性依赖。例如，一个 shorthand 扩展没有自己的指令，却需要完整的依赖展开和架构字符串规范化；一个特权扩展可能需要 CSR 与 header 支持，却完全不需要 GCC 自动生成代码。
+
+=== ISA名称、版本与依赖识别
+
+这一层负责让工具链知道“目标具备什么能力”。典型工作包括：
+
+* GCC / Binutils 接受并验证 `-march` 中的扩展名和版本。
+* 处理扩展依赖、隐含扩展、冲突关系、canonical order 和 shorthand 展开。
+* 按需提供预定义宏、target feature 或内部 feature bit。
+* 在对象文件中记录架构信息，例如 `.riscv.attributes` 中的 `Tag_RISCV_arch`，并在链接阶段执行合并或冲突检查。
+
+这往往是许多“没有新指令”的扩展仍需要工具链工作的主要原因。例如 GCC 在 `-march` 选项中已支持 Zkt、Zic64b、Smepmp 等扩展。(小技巧 GCC 提供 `-march=help` 选项来列出当编译器支持的扩展列表)
+
+[IMPORTANT]
+====
+ELF 中记录了 `Tag_RISCV_arch`，并不意味着处理器在执行二进制前一定会自动读取该属性并拒绝不兼容程序。对象属性主要服务于编译、汇编和链接阶段；运行时是否校验目标能力，取决于操作系统、loader、运行库或应用自己的 feature detection 机制。
+====
+
+=== 汇编器与反汇编器：新增指令时的最小闭环
+
+只要扩展新增了正式 mnemonic、编码、伪指令、CSR 名称或特殊操作数，assembler / disassembler 就需要评估支持。对 GNU Binutils 而言，常见工作包括 opcode 描述、operand parser、合法性检查、GAS 测试和 objdump 反汇编测试。
+
+“支持汇编”不只是让一条合法指令通过，还必须包含负向测试：未启用扩展时拒绝指令、非法立即数或寄存器组合被诊断、RV32/RV64 差异正确、依赖版本正确。反汇编也应保证编码与 mnemonic 的 round-trip 一致。
+
+=== 链接器、ELF 与 ABI：只有语义真的跨越对象文件时才需要
+
+不是每个新指令扩展都需要修改 linker。如果扩展只增加独立指令，现有 relocation 和 ABI 往往已经足够。但出现以下情况时，就必须进入 linker / psABI 层面：
+
+* 新增 relocation、指令序列重写或 linker relaxation。
+* 改变调用约定、参数传递、callee-saved 状态或可分配寄存器集合。
+* 不同对象文件之间存在不能简单取并集的扩展冲突或版本兼容问题。
+* 需要新的 ELF flag、attribute、note 或动态链接器可见信息。
+
+=== Builtin 与 intrinsic：解决“如何显式调用”
+
+Builtin 和 intrinsic 经常被混为一谈，但它们关注的层面不同。Builtin 通常是编译器内部识别的特殊函数或语义节点；intrinsic 是面向用户的稳定接口，通常由头文件、类型系统和 API 约定组成，并可能映射到一个或多个 builtin。
+
+当普通 C/C++ 无法准确表达某个操作，或者程序员必须保证使用特定指令、访问特定状态时，显式接口通常有价值。但“规范新增了指令”并不自动意味着必须为每条指令提供 builtin，更不意味着必须同时设计一套公共 intrinsic API。
+
+=== Compiler codegen：只有编译器能够安全推导时才做
+
+自动 codegen 的目标是让普通语言表达式在启用扩展后自然生成新指令。这通常涉及 machine description、expand / combine pattern、RTL 或 GIMPLE 优化、vectorizer、成本模型、调度模型和 testsuite。
+
+是否值得做自动 codegen，需要同时满足两个条件：语义等价，并且在目标微架构上通常有收益。对于具有副作用、依赖内存属性、特权权限或安全策略的指令，编译器往往不应该“猜测”何时插入，而应优先提供显式接口。
+
+=== 调试器、运行库与系统软件：新增“状态”时不可忽略
+
+如果扩展新增的是可分配寄存器类别，例如向量或矩阵状态，影响范围会扩展到 ABI、寄存器分配、保存恢复、DWARF、GDB、上下文切换和异常展开。若只是新增 CSR 或 CSR 字段，重点通常是 assembler 名称、公共 header、固件 / 内核访问接口以及调试器显示，而不是通用寄存器分配。
+
+当程序不能在编译时确定运行机器的扩展集合时，还需要运行时 feature detection、函数多版本化或 dispatch。它们通常横跨 compiler runtime、C library 和 OS 接口，不能仅靠 `-march` 或 ELF attribute 解决。
+
+=== 测试、文档与 CI 不是“收尾”，而是支持定义的一部分
+
+一个扩展的支持是否完整，最终要靠测试约束。至少应覆盖：启用后成功、未启用时失败、版本和依赖关系、RV32/RV64 差异、assembler / disassembler round-trip、compiler codegen gating，以及不同对象属性的链接行为。
+
+== 一个可执行的判断流程
+
+. 先确认规范状态：记录名称、版本、适用架构、依赖和冲突。
+. 列出新增的软件可见内容：分别检查指令、编码、寄存器、CSR、状态、行为保证、平台属性和 shorthand 关系。
+. 确定最小正确性支持：新指令通常以 assembler / disassembler 为起点；属性类扩展则以 ISA parser、依赖处理和对象属性为起点。
+. 判断是否需要显式编程接口：普通语言无法表达、必须精确控制或有副作用的操作，优先考虑 builtin / intrinsic / header API。
+. 判断是否需要自动 codegen：只有语义可安全推导且具有普遍收益时，才进入 backend pattern、优化和成本模型。
+. 检查跨对象和跨进程边界：涉及 ABI、ELF、relocation、relaxation、动态链接或运行时差异时，扩展支持会超出编译器后端。
+. 用正负测试封闭边界：明确“启用时允许什么、未启用时禁止什么、不同版本如何处理”，并在 CI 中长期维护。
+
+=== 四个快速验证命令
+
+[source,shell]
+----
+# 查看当前 GCC 版本支持的扩展
+riscv64-unknown-linux-gnu-gcc -march=help
+
+# 编译并指定目标扩展
+riscv64-unknown-linux-gnu-gcc -march=rv64gc_zbb -c demo.c -o demo.o
+
+# 查看对象文件中的 RISC-V attributes
+riscv64-unknown-linux-gnu-readelf -A demo.o
+
+# 验证汇编与反汇编 round-trip
+riscv64-unknown-linux-gnu-as -march=rv64gc_zbb demo.s -o demo-asm.o
+riscv64-unknown-linux-gnu-objdump -d demo-asm.o
+----
+
+== 用几个典型扩展验证这套方法
+
+[cols="1,3,4,4",options="header"]
+|===
+|扩展 |规范变化 |通常需要的最小支持 |是否一定需要 GCC 自动 codegen
+
+|Zbb
+|新增 `andn`、`ror`、`rev8` 等位操作指令
+|ISA parser、assembler/disassembler、正负测试；编译器可进一步加入 pattern 与成本模型
+|不一定“每条指令都要 builtin”，但许多操作适合从普通表达式自动生成
+
+|Zicbom
+|新增 `CBO.INVAL`、`CBO.CLEAN`、`CBO.FLUSH`，且受特权配置控制
+|ISA parser、assembler/disassembler；通常需要显式 API、headers 和系统软件配合
+|通常不应由编译器随意自动插入，因为其副作用和内存语义依赖使用场景
+
+|Zkt
+|不定义一组新指令，而是对一部分已实现指令给出数据无关执行延迟保证
+|`-march` / feature 识别、版本与对象属性、运行时特性暴露；不需要新增 opcode
+|不一定；更重要的是安全语义、库选择和运行时检测
+
+|Zic64b
+|声明 cache block 大小为 64 字节，属于能力 / 属性描述
+|架构字符串 / Profile 解析、对象属性；库或优化可选择利用该属性
+|不一定，也没有新 mnemonic 需要汇编
+
+|Zks / Zk
+|shorthand / aggregate extension，自身主要表达一组扩展的集合关系
+|依赖展开、canonicalization、版本与 attribute 记录
+|没有独立 codegen；实际 codegen 来自其包含的子扩展
+
+|Smepmp
+|特权扩展，向 `mseccfg` 加入 `RLB`、`MMWP`、`MML` 字段并改变 PMP 规则
+|扩展名识别、CSR / header / 固件与内核支持；必要时调试器支持
+|一般不需要通用 C/C++ 自动 codegen
+|===
+
+=== 为什么 Zkt 和 Zic64b 很有代表性
+
+它们说明“是否有新指令”不是唯一判断标准。Zkt 的价值是声明执行延迟属性，Zic64b 的价值是声明缓存块大小；这类能力不会产生新的 assembler mnemonic，却仍可能需要编译器驱动、构建系统、对象属性和运行时环境能够准确描述。
+
+=== 为什么 Smepmp 不适合作为“什么都没新增”的例子
+
+Smepmp 没有新增普通算术指令，但它并非完全没有架构状态变化：规范为 `mseccfg` 定义了 `RLB`、`MMWP` 和 `MML` 字段，并改变 PMP 的权限解释。因此，它更适合用来说明“特权扩展的支持重点与普通指令扩展不同”。
+
+== 五个常见误区
+
+. *“新增指令就必须完整支持 GCC。”* 新增指令首先意味着 assembler / disassembler 需要工作；builtin、intrinsic 和 auto codegen 是否需要，应分别判断。
+. *“没有新指令就不需要工具链。”* 属性、行为保证、shorthand、Profile 要求同样可能需要 `-march`、依赖处理和 ELF metadata。
+. *“工具链记录了扩展，硬件就会自动检查。”* 对象属性主要用于构建和链接；运行时检查需要单独的系统机制。
+. *“规范 ratified 就等于所有工具版本都支持。”* 规范状态与具体 GCC / Binutils / LLVM release 的实现进度是两件事。
+. *“builtin 和 intrinsic 是同一个东西。”* Builtin 是编译器内部能力，intrinsic 是面向用户的 API；两者可能映射，但设计目标和稳定性承诺不同。
+
+== 最终 checklist：从规范到可合入实现
+
+[cols="2,6,4",options="header"]
+|===
+|检查项 |需要回答的问题 |可能涉及的组件
+|规范身份 |名称、版本、状态、RV32/RV64、公开链接是否明确？ |文档、driver、tests
+|分类 |unprivileged、privileged、Profile 属性、shorthand 还是 vendor extension？ |决定主要支持路径
+|指令与编码 |是否新增 mnemonic、encoding、pseudo、operand？ |opcode、GAS、objdump
+|寄存器与状态 |是否新增 GPR/FP/vector 类状态、CSR 或字段？ |assembler、headers、GDB、ABI、compiler
+|依赖与冲突 |隐含哪些扩展？版本怎样规范化？与谁冲突？ |`-march` parser、attributes、linker
+|对象兼容性 |是否影响 ELF、ABI、relocation、relaxation 或调用约定？ |psABI、assembler、linker、loader
+|显式接口 |程序员是否需要精确访问，普通语言是否无法表达？ |builtin、intrinsic、headers
+|自动生成 |编译器能否证明语义等价，并且通常有性能收益？ |backend、optimizer、cost model
+|运行时差异 |目标能力是否只能在运行时确认？ |runtime、libc、OS、multiversioning
+|验证闭环 |是否有启用/禁用、合法/非法、版本/依赖、RV32/RV64 测试？ |testsuite、CI、文档
+|===
+
+[quote]
+____
+一句话判断法：先问“规范改变了什么软件可见属性”，再问“哪个工具必须理解这个属性”。不要从“我要改 GCC 还是 Binutils”反向猜需求。
+____
+
+== 结语
+
+判断一个 RISC-V 扩展是否需要工具链支持，真正难的不是找到一个 yes / no，而是确定“最小正确性支持”和“可选的性能 / 易用性支持”之间的边界。
+
+新增指令通常从 assembler / disassembler 开始；新增架构状态可能扩展到 ABI、debugger 和系统软件；属性类或 shorthand 扩展即使没有新 opcode，也可能需要完善的 ISA parser、依赖展开和 ELF metadata；只有在语义可安全推导且收益明确时，才应该进入 compiler auto codegen。
+
+按照“规范特征清单 → 支持矩阵 → 决策流程 → 正负测试”的顺序工作，可以避免过度实现，也能避免只加一条 `-march` 名称却留下对象兼容性、运行时检测或测试边界问题。
+
+== English summary
+
+Whether a RISC-V extension needs toolchain support is rarely a binary question. The practical question is which software-visible contracts are changed and which toolchain components must understand them. New instructions normally require assembler and disassembler support, while compiler builtins, intrinsics, and automatic code generation are separate decisions. Extensions without new opcodes may still require ISA-string parsing, dependency expansion, ELF attributes, feature detection, or system-software support. A reliable workflow starts from the specification, maps each architectural change to the minimum necessary components, and closes the implementation with positive and negative tests.
+
+== 参考资料
+
+. https://docs.riscv.org/reference/home/index.html[RISC-V Ratified Specifications Library]
+. https://docs.riscv.org/reference/isa/unpriv/unpriv-index.html[RISC-V Instruction Set Manual, Volume I: Unprivileged Architecture]
+. https://docs.riscv.org/reference/isa/priv/priv-index.html[RISC-V Instruction Set Manual, Volume II: Privileged Architecture]
+. https://docs.riscv.org/reference/isa/unpriv/naming.html[ISA Extension Naming Conventions]
+. https://gcc.gnu.org/onlinedocs/gcc/RISC-V-Options.html[GCC: RISC-V Options]
+. https://sourceware.org/binutils/docs/as/RISC_002dV_002dATTRIBUTE.html[GNU as: RISC-V Object Attribute]
+. https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc[RISC-V ELF psABI Specification]
+. https://docs.riscv.org/reference/isa/unpriv/cmo.html[RISC-V CMO Extensions]
+. https://docs.riscv.org/reference/isa/unpriv/scalar-crypto.html[RISC-V Scalar Cryptography Extensions]
+. https://docs.riscv.org/reference/isa/unpriv/b-st-ext.html[RISC-V Bit Manipulation Extensions]
+. https://docs.riscv.org/reference/isa/priv/smepmp.html[RISC-V Smepmp Extension]
+. https://github.com/riscv-non-isa/riscv-toolchain-conventions/blob/main/src/toolchain-conventions.adoc[RISC-V Toolchain Conventions]
+. https://docs.riscv.org/reference/rva23/rva23-profiles.html[RISC-V Profiles]
+
+== License
+
+本文正文采用 CC BY-NC-SA 4.0；代码示例采用 MIT License。
